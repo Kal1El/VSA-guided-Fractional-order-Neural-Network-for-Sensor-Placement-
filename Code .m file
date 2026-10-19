@@ -1,0 +1,1535 @@
+function R = pmu_vsa_milp_nominal10(mode)
+clc; close all;
+if nargin<1, mode='full'; end
+if strcmpi(mode,'selftest'), selftest();R=[];return;end
+if exist('loadcase','file')~=2
+    error('MATPOWER loadcase.m not found. Initialize MATPOWER before running.');
+end
+c=config(mode);
+if ~exist(c.out,'dir'),mkdir(c.out);end
+methods={'FORNN','IORNN','BPSO','BGWO','GA'};
+R=struct('Config',c,'Nominal',table(),'Runs',table(), ...
+    'Summary',table(),'Comparison',table(),'AlphaSearch',table(),'AlphaSelected',table(), ...
+    'AlphaShortlist',table(),'MILP',table(),'Energy',table(), ...
+    'Convergence',table(),'ConvergenceSummary',table());
+for ni=1:numel(c.networks)
+    base=network(c.networks{ni});
+    for si=1:numel(c.scenarios)
+        M=base;
+        M.scenario=c.scenarios{si};
+        M.required=1+strcmp(M.scenario,'N-1');
+        baseSeed=c.seed+100000*ni+10000*si;
+        M.cap=2;  % Search alpha ONLY at baseline C=2.
+        fprintf('\n===============================================================\n');
+        fprintf('%s / %s | 2-current-channel alpha training (VSA)\n', ...
+            M.name,M.scenario);
+        [alpha,H,P,vsaSec]=vsa_alpha(M,c,baseSeed+700000);
+        hN=height(H);
+        H.System=repmat(string(M.name),hN,1);
+        H.Scenario=repmat(string(M.scenario),hN,1);
+        H=movevars(H,{'System','Scenario'},'Before','Evaluation');
+        R.AlphaSearch=cat_table(R.AlphaSearch,H);
+        P.System=repmat(string(M.name),height(P),1);
+        P.Scenario=repmat(string(M.scenario),height(P),1);
+        P=movevars(P,{'System','Scenario'},'Before','Alpha');
+        R.AlphaShortlist=cat_table(R.AlphaShortlist,P);
+        R.AlphaSelected=cat_table(R.AlphaSelected,table( ...
+            string(M.name),string(M.scenario),2,alpha,vsaSec, ...
+            'VariableNames',{'System','Scenario','AlphaTrainingChannels', ...
+            'SelectedAlpha','VSASearchSec'}));
+        fprintf('SELECTED FORNN alpha = %.2f | IORNN alpha = 1.00\n',alpha);
+        fprintf('One NOMINAL + %d RANDOMIZED runs for each algorithm and capacity.\n',c.runs);
+
+        % The exact same nominal initial state/population for every cap;
+        % and the same run-r initializations across caps for paired analysis.
+        [nx,nw,np]=starting_data(M,c,baseSeed+12345,0);
+        % Important: C changes ONLY before an independent solve.
+        for ci=1:numel(c.channels)
+            M.cap=c.channels(ci);
+            fprintf('\n--- %s / %s | FIXED CHANNEL CAPACITY = %d ---\n', ...
+                M.name,M.scenario,M.cap);
+            % Independent MILP reference. No method receives its solution.
+            [mrow,~]=run_exact_lex_milp(M,c);
+            R.MILP=cat_table(R.MILP,mrow);
+            fprintf('  MILP: %s | PMUs=%s channels=%s | PMU proof=%d lexicographic proof=%d | %.2fs\n', ...
+                char(mrow.MILPStatus),numtext(mrow.MILP_PMUs), ...
+                numtext(mrow.MILP_Channels),mrow.PMUOptimal,mrow.LexOptimal, ...
+                mrow.MILPRuntimeSec);
+            fprintf('NOMINAL (one pre-specified start, not best of 10):\n');
+            for mi=1:numel(methods)
+                method=methods{mi};
+                a=1;
+                if strcmp(method,'FORNN'),a=alpha;end
+                rng(baseSeed+800000+109*mi,'twister');
+                t=tic;
+                [native,repaired,post,N]=solve_method(M,c,method,a,nx,nw,np, ...
+                    baseSeed+900000);
+                elapsed=toc(t);
+                d0=details(M,native);d1=details(M,repaired);d2=details(M,post);
+                assert(M.cap==c.channels(ci),'Channel cap changed within solve.');
+                R.Nominal=cat_table(R.Nominal,table( ...
+                    string(M.name),string(M.scenario),M.cap,string(method), ...
+                    a,d0.n,d1.n,d2.n,d2.ch,d2.ok,d2.buses,d2.assignment,elapsed, ...
+                    'VariableNames',{'System','Scenario','Channels','Method', ...
+                    'Alpha','NativePMUs','RepairedPMUs','NominalPMUs', ...
+                    'NominalAssignedChannels','Feasible','PMUBuses', ...
+                    'ChannelAssignments','RuntimeSec'}));
+                fprintf('  %-5s  NOMINAL PMUs=%-4s channels=%-4s feasible=%d buses: %s\n', ...
+                    method,numtext(d2.n),numtext(d2.ch),d2.ok,char(d2.buses));
+                if M.cap==2 && strcmp(M.scenario,'Simple') && ...
+                        (strcmp(method,'FORNN') || strcmp(method,'IORNN'))
+                    count=numel(N.times);
+                    E=table(repmat(string(M.name),count,1), ...
+                        repmat(string(method),count,1),N.times(:),N.energy(:), ...
+                        N.relaxedCount(:), ...
+                        'VariableNames',{'System','Method','Time', ...
+                        'AugmentedEnergy','ContinuousPMUs'});
+                    R.Energy=cat_table(R.Energy,E);
+                end
+            end
+
+            % Ten fresh stochastic trials; never include nominal in summary.
+            for run=1:c.runs
+                [x0,w0,pop]=starting_data(M,c,baseSeed+200000+1009*run,1);
+                for mi=1:numel(methods)
+                    method=methods{mi};a=1;
+                    if strcmp(method,'FORNN'),a=alpha;end
+                    rng(baseSeed+1000000+1009*run+109*mi,'twister');
+                    t=tic;
+                    [native,repaired,post,N]=solve_method(M,c,method,a,x0,w0,pop, ...
+                        baseSeed+9000000+1009*run);
+                    elapsed=toc(t);
+                    d0=details(M,native);d1=details(M,repaired);d2=details(M,post);
+                    assert(M.cap==c.channels(ci),'Channel cap changed within trial.');
+                    R.Runs=cat_table(R.Runs,table( ...
+                        string(M.name),string(M.scenario),M.cap, ...
+                        string(method),run,a,d0.n,d1.n,d2.n,d2.ch, ...
+                        d2.ok,d2.buses,d2.assignment,elapsed, ...
+                        'VariableNames',{'System','Scenario','Channels', ...
+                        'Method','Run','Alpha','NativePMUs','RepairedPMUs', ...
+                        'FinalPMUs','AssignedChannels','Feasible','PMUBuses', ...
+                        'ChannelAssignments','RuntimeSec'}));
+                    fprintf('  run %2d  %-5s  PMUs=%-4s channels=%-4s feasible=%d\n', ...
+                        run,method,numtext(d2.n),numtext(d2.ch),d2.ok);
+                    % One nominal trace for all methods at C=2, or
+                    % run-1 trace at other capacities for diagnostics.
+                    if M.cap==2 || run==1
+                        nsteps=numel(N.rawTrace);
+                        T=table(repmat(string(M.name),nsteps,1), ...
+                            repmat(string(M.scenario),nsteps,1), ...
+                            repmat(M.cap,nsteps,1), ...
+                            repmat(string(method),nsteps,1), ...
+                            repmat(run,nsteps,1),(0:nsteps-1)', ...
+                            linspace(0,100,nsteps)',N.rawTrace(:),N.bestTrace(:), ...
+                            'VariableNames',{'System','Scenario','Channels', ...
+                            'Method','Run','Step','ProgressPct','RawPMUs', ...
+                            'BestFeasibleNativePMUs'});
+                        R.Convergence=cat_table(R.Convergence,T);
+                    end
+                end
+            end
+            Q=R.Runs(R.Runs.System==string(M.name) & ...
+                R.Runs.Scenario==string(M.scenario) & ...
+                R.Runs.Channels==M.cap,:);
+            % The per-capacity console summary needs the MILP hit columns.
+            % R.Runs is joined globally after the experiment loops, so
+            % attach the current verified reference to this LOCAL table first.
+            Q=attach_milp(Q,mrow,'FinalPMUs','AssignedChannels');
+            S=make_simple_summary(Q);
+            fprintf('\n%10s  %12s %12s %12s %9s\n', ...
+                'Method','NominalPMUs','MeanPMUs','SDPMUs','Success%');
+            for mi=1:numel(methods)
+                mm=string(methods{mi});
+                no=R.Nominal(R.Nominal.System==string(M.name) & ...
+                    R.Nominal.Scenario==string(M.scenario) & ...
+                    R.Nominal.Channels==M.cap & R.Nominal.Method==mm,:);
+                ss=S(S.Method==mm,:);
+                if ~isempty(no) && ~isempty(ss)
+                    fprintf('%10s  %12s %12.3f %12.3f %9.1f\n', ...
+                        methods{mi},numtext(no.NominalPMUs(1)), ...
+                        ss.MeanPMUs(1),ss.SDPMUs(1),ss.SuccessPct(1));
+                end
+            end
+        end
+    end
+end
+% Attach exact-reference counts and hit flags before aggregating.
+% An unproved MILP reference gives NaN for hit flags, not false/zero.
+R.Runs=attach_milp(R.Runs,R.MILP,'FinalPMUs','AssignedChannels');
+R.Nominal=attach_milp(R.Nominal,R.MILP,'NominalPMUs','NominalAssignedChannels');
+R.Summary=make_simple_summary(R.Runs);
+R.Comparison=innerjoin(R.Nominal,R.Summary, ...
+    'Keys',{'System','Scenario','Channels','Method'});
+R.ConvergenceSummary=make_native_summary(R.Convergence);
+write_simple_outputs(R,c);
+try
+    save(fullfile(c.out,'Results.mat'),'R','-v7.3');
+catch err
+    warning('Unable to save MAT file: %s',err.message);
+end
+fprintf('\nAll nominal PMU counts and randomized mean/SD:\n');
+if ~isempty(R.Comparison),disp(R.Comparison(:,{'System','Scenario','Channels', ...
+    'Method','NominalPMUs','NominalAssignedChannels', ...
+    'MILP_PMUs','MILP_Channels','PMUOptimal','LexOptimal', ...
+    'NominalPMUGlobalMatch','NominalLexGlobalMatch', ...
+    'MeanPMUs','SDPMUs','MeanChannels','SDChannels','SuccessPct', ...
+    'PMUGlobalHitPct','LexGlobalHitPct'}));end
+fprintf('\nResults and figures: %s\n',c.out);
+end
+
+function c=config(mode)
+c=struct('seed',20261019,'networks',{{'case14','case118'}}, ...
+    'scenarios',{{'Simple','ZIB','N-1'}}, ...
+    'channels',2:5,'runs',10, ...
+    'population',12,'generations',12,'rnnStarts',1, ...
+    'bpsoWMax',0.9,'bpsoWMin',0.4,'bpsoC1',2,'bpsoC2',2, ...
+    'bpsoVmax',6,'bgwoSlope',10, ...
+    'dt',.1,'duration',5,'penaltyObs',2.5,'penaltyCh',1.5, ...
+    'maxSteps',150,'alphaLo',.1,'alphaHi',1, ...
+    'vsaPopulation',8,'vsaIterations',10,'vsaShape',.1, ...
+    'vsaResolution',.01,'vsaCheapStarts',1,'vsaPolishStarts',2, ...
+    'vsaPolishTop',8, ...
+    'milpTimeLimitSec',120,'milpDisplay','off', ...
+    'archiveMax',4,'postSwaps',8,'tracePoints',21, ...
+    'showFigures',true,'out',fullfile(pwd,['pmu_VSA_MILP_nominal10_' lower(mode)]));
+switch lower(mode)
+    case 'smoke'
+        c.networks={'case14'};c.scenarios={'Simple'};c.channels=2:3;
+        c.runs=1;c.population=6;c.generations=2;c.rnnStarts=1;
+        c.duration=1;c.vsaIterations=2;c.vsaPopulation=3;
+        c.vsaCheapStarts=1;c.vsaPolishStarts=1;
+        c.vsaPolishTop=3;c.milpTimeLimitSec=15;
+        c.postSwaps=2;
+    case 'quick'
+        c.networks={'case14'};c.scenarios={'Simple'};c.channels=2:5;
+        c.runs=2;c.population=8;c.generations=4;c.rnnStarts=2;
+        c.duration=2;c.vsaIterations=4;c.vsaPopulation=5;
+        c.vsaCheapStarts=1;c.vsaPolishStarts=1;
+        c.vsaPolishTop=4;c.milpTimeLimitSec=45;
+    case 'full'
+        % 1 nominal and exactly 10 random runs per method, capacity,
+        % test system and observability case.
+    otherwise
+        error('Choose selftest, smoke, quick or full.');
+end
+end
+
+function [x0,w0,pop]=starting_data(M,c,seed,isRandom)
+% Matched initial inputs across channel capacities. Initial states are
+% nominal 0.50 +/- 0.05 versus randomized 0.50 +/- 0.30.
+rng(seed,'twister');
+if isRandom,halfWidth=.30;else,halfWidth=.05;end
+x0=.5+halfWidth*(2*rand(M.n,c.rnnStarts)-1);
+w0=.5+halfWidth*(2*rand(M.arcN,c.rnnStarts)-1);
+pop=rand(M.n+M.arcN,c.population)<.5;
+end
+
+function [native,repaired,post,N]=solve_method(M,c,method,alpha,x0,w0,pop,postSeed)
+% Fixed M.cap for the entire call; all five solvers share the decoder and
+% identical repair/local improvement. The native solver is not warm-started
+% from the MILP or from another optimization method.
+if strcmp(method,'FORNN') || strcmp(method,'IORNN')
+    N=run_neural(M,c,alpha,x0,w0);
+else
+    N=run_population(M,c,method,pop);
+end
+native=N.bestNative;
+repaired=repair_archive(M,N.archive,c,native);
+rng(postSeed,'twister');
+post=local_post(M,repaired,c.postSwaps);
+end
+
+function M=network(name)
+p=loadcase(name);ids=p.bus(:,1);n=numel(ids);
+[aok,a]=ismember(p.branch(:,1),ids);
+[bok,b]=ismember(p.branch(:,2),ids);
+assert(all(aok & bok),'MATPOWER branch references unknown bus.');
+active=true(numel(a),1);
+if size(p.branch,2)>=11,active=p.branch(:,11)>0;end
+a=a(active);b=b(active);valid=a~=b;a=a(valid);b=b(valid);
+Adj=spones(sparse([a;b],[b;a],1,n,n));
+[from,to]=find(Adj);
+numArcs=numel(from);
+incoming=cell(n,1);outgoing=cell(n,1);
+for k=1:numArcs
+    incoming{to(k)}(end+1)=k; %#ok<AGROW>
+    outgoing{from(k)}(end+1)=k; %#ok<AGROW>
+end
+zero=abs(p.bus(:,3))<1e-9 & abs(p.bus(:,4))<1e-9;
+if size(p.bus,2)>=6
+    zero=zero & abs(p.bus(:,5))<1e-9 & abs(p.bus(:,6))<1e-9;
+end
+if isfield(p,'gen') && ~isempty(p.gen)
+    genon=true(size(p.gen,1),1);
+    if size(p.gen,2)>=8,genon=p.gen(:,8)>0;end
+    [valid,gi]=ismember(p.gen(genon,1),ids);
+    zero(gi(valid))=false;
+end
+clusters=cell(0,1);
+for j=find(zero(:))'
+    clusters{end+1,1}=unique([j;find(Adj(j,:))']); %#ok<AGROW>
+end
+M=struct('name',name,'n',n,'ids',ids,'Adj',Adj, ...
+    'arcFrom',from,'arcTo',to,'arcN',numArcs, ...
+    'in',{incoming},'out',{outgoing},'clusters',{clusters}, ...
+    'scenario','Simple','required',1,'cap',2);
+end
+
+function N=empty_native()
+N=struct('archive',struct('x',{},'w',{},'miss',{},'n',{},'ch',{},'ok',{}), ...
+    'bestNative',[],'rawFeasible',0,'evals',0, ...
+    'rawTrace',[],'bestTrace',[],'energy',[],'times',[],'relaxedCount',[]);
+end
+
+function N=add_candidate(M,N,x,w,maxArchive)
+x=logical(x(:));w=double(w(:));
+[ok,observed,Y]=native_assign(M,x,w);
+miss=nnz(~observed);n=nnz(x);ch=nnz(Y);
+N.evals=N.evals+1;
+if ok
+    N.rawFeasible=N.rawFeasible+1;
+    curr=details(M,N.bestNative);
+    if better(n,ch,curr.n,curr.ch)
+        N.bestNative=struct('x',x,'w',w,'Y',Y);
+    end
+end
+r=struct('x',x,'w',w,'miss',miss,'n',n,'ch',ch,'ok',ok);
+if isempty(N.archive)
+    N.archive=r;
+else
+    duplicated=any(arrayfun(@(v)isequal(v.x,x),N.archive));
+    if ~duplicated
+        N.archive(end+1)=r;
+        A=N.archive;rank=[[A.miss]' [A.n]' [A.ch]'];
+        [~,order]=sortrows(rank,[1 2 3]);
+        N.archive=A(order(1:min(maxArchive,numel(order))));
+    end
+end
+end
+
+function N=run_neural(M,c,alpha,x0,w0)
+N=empty_native();
+for j=1:size(x0,2)
+    u0=[x0(:,j);w0(:,j);zeros(2*M.n,1)];
+    F=@(t,u)neural_rhs(u,M,c);P=@(u)project(u,M);
+    if alpha>=1-1e-10
+        [times,U]=rk4(F,P,u0,c);
+    else
+        [times,U]=caputo(alpha,F,P,u0,c);
+    end
+    if j==1
+        N.times=times(:);N.energy=zeros(numel(times),1);
+        N.relaxedCount=zeros(numel(times),1);
+        for k=1:numel(times)
+            N.energy(k)=energy_value(U(:,k),M,c);
+            N.relaxedCount(k)=sum(U(1:M.n,k));
+            N=add_candidate(M,N,U(1:M.n,k)>=.5, ...
+                U(M.n+(1:M.arcN),k),c.archiveMax);
+            N.rawTrace(end+1,1)=nnz(U(1:M.n,k)>=.5);
+            z=details(M,N.bestNative);N.bestTrace(end+1,1)=z.n;
+        end
+    end
+    for th=[.35 .5 .65]
+        N=add_candidate(M,N,U(1:M.n,end)>=th, ...
+            U(M.n+(1:M.arcN),end),c.archiveMax);
+    end
+end
+if isempty(N.rawTrace)
+    N.rawTrace=NaN;N.bestTrace=NaN;
+end
+end
+
+function N=run_population(M,c,method,initial)
+% Reference BPSO/BGWO update rules, with a shared lexicographic evaluator.
+% The reference routines store candidate genomes as POPULATION x DIMENSION;
+% adapt our input columns to that orientation. Both PMU bits and directed
+% current-channel bits are searched. No MILP/warm starts and no repairs
+% within the native optimizer (only capacity sanitization).
+[D,pop]=size(initial);assert(D==M.n+M.arcN && pop>=3);
+X=double(initial'); N=empty_native();
+[fit,X,N]=evaluate_population(M,N,X,c.archiveMax);
+V=zeros(pop,D);pbest=X;pfit=fit;
+[globalFit,bestId]=min(pfit);gbest=pbest(bestId,:);
+if strcmp(method,'BGWO')
+    % Continuous GWO positions: EXACT initialization from supplied source.
+    Xc=0.25+0.5*double(initial')+0.1*(rand(pop,D)-0.5);
+end
+[N.rawTrace,N.bestTrace]=meta_trace(M,N,X,fit);
+for iteration=1:c.generations
+    switch method
+        case 'BPSO'
+            % Supplied run_bpso: inertia 0.9 -> 0.4; c1=c2=2; vmax=6;
+            % pbest/gbest and logistic Bernoulli sampling.
+            inertia=c.bpsoWMax-(c.bpsoWMax-c.bpsoWMin)* ...
+                (iteration-1)/max(1,c.generations-1);
+            r1=rand(pop,D);r2=rand(pop,D);
+            V=inertia*V+c.bpsoC1*r1.*(pbest-X)+ ...
+                c.bpsoC2*r2.*(repmat(gbest,pop,1)-X);
+            V=max(-c.bpsoVmax,min(c.bpsoVmax,V));
+            probability=1./(1+exp(-V));
+            trial=double(rand(pop,D)<probability);
+        case 'BGWO'
+            % Supplied run_bgwo: continuous alpha/beta/delta leaders,
+            % a(t) decreases 2 -> 0; 3 leader position updates; clipped
+            % mean and sigmoid 10*(Xc-0.5) -> sampled binary positions.
+            [~,order]=sort(fit,'ascend');leaders=Xc(order(1:3),:);
+            a=2-2*(iteration-1)/max(1,c.generations-1);
+            Xnew=zeros(pop,D);
+            for k=1:3
+                A=2*a*rand(pop,D)-a;
+                C=2*rand(pop,D);
+                separation=abs(C.*repmat(leaders(k,:),pop,1)-Xc);
+                Xnew=Xnew+(repmat(leaders(k,:),pop,1)-A.*separation)/3;
+            end
+            Xc=max(0,min(1,Xnew));
+            probability=1./(1+exp(-c.bgwoSlope*(Xc-0.5)));
+            trial=double(rand(pop,D)<probability);
+        case 'GA'
+            % Added comparison: binary tournament, uniform crossover,
+            % independent bit flip at 1/D, and one elitist survivor.
+            trial=zeros(pop,D);
+            for j=1:pop
+                parent=tournament_fit(fit);
+                mate=tournament_fit(fit);
+                swap=rand(1,D)<.5;
+                z=X(parent,:);z(swap)=X(mate,swap);
+                mutate=rand(1,D)<1/D;z(mutate)=1-z(mutate);
+                trial(j,:)=z;
+            end
+            [~,bestId]=min(fit);
+            trial(1,:)=X(bestId,:);
+        otherwise
+            error('Unknown metaheuristic: %s.',method);
+    end
+    [newFit,Xnew,N]=evaluate_population(M,N,trial,c.archiveMax);
+    X=Xnew;fit=newFit;
+    if strcmp(method,'BPSO')
+        improved=fit<pfit;
+        pbest(improved,:)=X(improved,:);pfit(improved)=fit(improved);
+        [bestFit,bestId]=min(pfit);
+        if bestFit<globalFit
+            globalFit=bestFit;gbest=pbest(bestId,:);
+        end
+    end
+    [raw,best]=meta_trace(M,N,X,fit);
+    N.rawTrace(end+1,1)=raw;
+    N.bestTrace(end+1,1)=best;
+end
+end
+
+function [fit,Xcanon,N]=evaluate_population(M,N,X,maxArchive)
+% Fitness and genotype sanitization correspond to meta_evaluate() plus
+% meta_canonical_row() in the user's reference. Penalties enforce that
+% every observable placement outranks every unobservable placement.
+[p,D]=size(X);n=M.n;
+assert(D==n+M.arcN,'Incorrect PMU/channel genome length');
+fit=zeros(p,1);Xcanon=zeros(p,D);
+lexPMU=M.arcN+1;infeasBase=(n+1)*lexPMU+M.arcN+1;
+arcIndices=sub2ind([n,n],M.arcFrom,M.arcTo);
+for j=1:p
+    x=X(j,1:n)'>=.5;
+    w=X(j,n+1:end)'>=.5;
+    N=add_candidate(M,N,x,w,maxArchive);
+    [ok,observed,Y]=native_assign(M,x,w);
+    nPMU=nnz(x);ch=nnz(Y);unobserved=nnz(~observed);
+    if ok
+        fit(j)=lexPMU*nPMU+ch;
+    else
+        fit(j)=infeasBase+lexPMU*unobserved+lexPMU*nPMU+ch;
+    end
+    Xcanon(j,:)=[double(x') double(Y(arcIndices)')];
+end
+end
+
+function [raw,best]=meta_trace(M,N,X,fit)
+[~,id]=min(fit);
+raw=nnz(X(id,1:M.n));
+d=details([],N.bestNative);
+best=d.n;
+end
+
+function j=tournament_fit(f)
+a=randi(numel(f));b=randi(numel(f));j=a;
+if f(b)<f(a) || (f(b)==f(a) && rand<.5), j=b;end
+end
+
+function yes=lex3(a,b)
+yes=false;
+for k=1:numel(a)
+    if a(k)<b(k),yes=true;return;end
+    if a(k)>b(k),return;end
+end
+end
+function yes=better(n,ch,oldN,oldCh)
+if ~isfinite(oldN),yes=true;return;end
+yes=(n<oldN || (n==oldN && ch<oldCh));
+end
+
+function D=details(M,s)
+D=struct('ok',false,'n',NaN,'ch',NaN,'buses',"",'assignment',"");
+if isempty(s),return;end
+x=s.x;w=s.w;
+if isempty(M)
+    D.n=nnz(x);D.ch=NaN;return;
+end
+if isfield(s,'Y')
+    Y=s.Y;
+    cov=double(x)+sum(Y,1)';
+    ok=all(observation(M,cov));
+else
+    [ok,~,~,Y]=decode(M,x,w);
+    if ok,Y=prune_channels(M,x,Y);end
+end
+if ~ok,return;end
+D.ok=true;D.n=nnz(x);D.ch=nnz(Y);
+D.buses=string(strtrim(sprintf('%d ',M.ids(x))));
+D.assignment=assignment_text(M,Y);
+end
+
+function s=repair_archive(M,A,c,incumbent)
+% Preserve the best NATIVE feasible placement: postprocessing cannot lose it.
+if nargin<4,incumbent=[];end
+s=incumbent;
+for k=1:numel(A)
+    q=repair_candidate(M,A(k).x,A(k).w);
+    if isempty(q),continue;end
+    d=details(M,q);old=details(M,s);
+    if better(d.n,d.ch,old.n,old.ch),s=q;end
+end
+end
+
+function s=repair_candidate(M,x,w)
+% Same constraint recovery for every method. No MILP warm-start.
+x=logical(x(:));w=w(:);
+for step=1:M.n
+    [ok,observed]=decode(M,x,w);
+    if ok,break;end
+    miss=find(~observed);
+    if isempty(miss),break;end
+    % Highest uncovered-neighbour gain, with original neural or binary
+    % scores used only to break equal-gain ties.
+    degreeGain=full(sum(M.Adj(:,miss),2));
+    degreeGain(miss)=degreeGain(miss)+1;
+    degreeGain(x)=-inf;
+    [best,j]=max(degreeGain);
+    if ~isfinite(best),break;end
+    x(j)=true;
+end
+[ok,~,~,Y]=decode(M,x,w);
+if ~ok,s=[];return;end
+% Drop PMUs while reassigning their neighbours' current channels.
+change=true;
+while change
+    change=false;
+    ids=find(x);
+    for j=ids(:)'
+        candidate=x;candidate(j)=false;
+        if decode(M,candidate,w)
+            x=candidate;change=true;
+        end
+    end
+end
+s=struct('x',x,'w',w);
+end
+
+function s=local_post(M,s,trials)
+% The exact same bounded one-for-one relocation and deletion for all five
+% optimizers. All accepted changes strictly improve (PMUs, channels).
+if isempty(s),return;end
+cur=details(M,s);
+for k=1:trials
+    a=find(s.x);b=find(~s.x);
+    if isempty(a) || isempty(b),break;end
+    i=a(randi(numel(a)));j=b(randi(numel(b)));
+    q=s;q.x(i)=false;q.x(j)=true;
+    if ~decode(M,q.x,q.w),continue;end
+    q=repair_candidate(M,q.x,q.w);
+    if isempty(q),continue;end
+    d=details(M,q);
+    if better(d.n,d.ch,cur.n,cur.ch)
+        s=q;cur=d;
+    end
+end
+end
+
+function [ok,observed,Y]=native_assign(M,x,w)
+% NATIVE optimizer proposal. No flow, no feasibility repair: the algorithm
+% chooses each PMU and each measured branch through its raw state/bits.
+x=logical(x(:));n=M.n;Y=false(n,n);
+for i=find(x)'
+    arcs=M.out{i};
+    if isempty(arcs),continue;end
+    selected=arcs(w(arcs)>=.5);
+    if numel(selected)>M.cap
+        [~,ord]=sort(w(selected),'descend');
+        selected=selected(ord(1:M.cap));
+    end
+    Y(i,M.arcTo(selected))=true;
+end
+cov=double(x)+sum(Y,1)';
+observed=observation(M,cov);ok=all(observed);
+end
+
+function [ok,observed,cov,Y]=decode(M,x,w)
+% Channel-aware assignment based on maximum-flow b-matching; then use
+% spare PMU channels to improve uncovered buses. PMU own voltage is free.
+% The decoder is applied identically to all algorithms.
+n=M.n;cap=M.cap;x=logical(x(:));Y=false(n,n);
+observed=false(n,1);cov=double(x);ok=false;
+installed=find(x);p=numel(installed);
+if p==0,return;end
+% Fast path when no installed PMU has more than cap incident branches.
+deg=full(sum(M.Adj(installed,:),2));
+if all(deg<=cap)
+    Y(installed,:)=logical(full(M.Adj(installed,:)));
+else
+    source=1;pmuNodes=1+(1:p);busNodes=1+p+(1:n);sink=p+n+2;
+    res=zeros(sink,sink);res(source,pmuNodes)=cap;
+    for i=1:p
+        nbr=find(M.Adj(installed(i),:));
+        res(pmuNodes(i),busNodes(nbr))=1;
+    end
+    demand=max(0,M.required-double(x));
+    % ZIB feasibility is subsequently checked using exact KCL closure.
+    res(busNodes,sink)=demand;
+    while true
+        prev=zeros(1,sink);prev(source)=-1;
+        queue=zeros(1,sink);queue(1)=source;tail=1;head=1;
+        while head<=tail && prev(sink)==0
+            u=queue(head);head=head+1;
+            for v=find(res(u,:)>0)
+                if prev(v)~=0,continue;end
+                prev(v)=u;tail=tail+1;queue(tail)=v;
+                if v==sink,break;end
+            end
+        end
+        if prev(sink)==0,break;end
+        step=inf;v=sink;
+        while v~=source
+            u=prev(v);step=min(step,res(u,v));v=u;
+        end
+        v=sink;
+        while v~=source
+            u=prev(v);res(u,v)=res(u,v)-step;
+            res(v,u)=res(v,u)+step;v=u;
+        end
+    end
+    for i=1:p,Y(installed(i),:)=res(busNodes,pmuNodes(i))'>.5;end
+    left=zeros(n,1);left(installed)=cap-sum(Y(installed,:),2);
+    cov=double(x)+sum(Y,1)';
+    % For ZIB inference, only allocate additional channels if an
+    % unobservable bus can be improved; avoid redundant installations.
+    for attempt=1:cap*p
+        observed=observation(M,cov);
+        if all(observed),break;end
+        [a,b]=find(M.Adj & ~Y);
+        allowed=x(a) & left(a)>0;
+        a=a(allowed);b=b(allowed);
+        if isempty(a),break;end
+        gain=~observed(b);
+        if ~any(gain),break;end
+        a=a(gain);b=b(gain);
+        score=wscore(M,a,b,w);
+        [~,q]=max(100./(1+cov(b))+score);
+        i=a(q);j=b(q);Y(i,j)=true;left(i)=left(i)-1;cov(j)=cov(j)+1;
+    end
+end
+cov=double(x)+sum(Y,1)';
+observed=observation(M,cov);ok=all(observed);
+assert(all(sum(Y,2)<=cap) && ~any(any(Y & ~logical(M.Adj))) ...
+    && ~any(any(Y(~x,:))),'Invalid current-channel assignment.');
+end
+
+function scores=wscore(M,a,b,w)
+% Score of oriented existing branch a -> b; fallback tie to order.
+scores=zeros(numel(a),1);
+for k=1:numel(a)
+    idx=M.out{a(k)};
+    j=idx(M.arcTo(idx)==b(k));
+    if ~isempty(j),scores(k)=w(j(1));end
+end
+end
+
+function obs=observation(M,cov)
+if strcmp(M.scenario,'N-1')
+    obs=cov>=2;
+else
+    obs=cov>=1;
+    if strcmp(M.scenario,'ZIB')
+        for iteration=1:M.n
+            before=obs;
+            for i=1:numel(M.clusters)
+                c=M.clusters{i};missing=c(~obs(c));
+                if numel(missing)==1,obs(missing)=true;end
+            end
+            if isequal(before,obs),break;end
+        end
+    end
+end
+end
+
+function Y=prune_channels(M,x,Y)
+% Reduce second objective while preserving observability and PMU count.
+if isempty(x),return;end
+from=find(any(Y,2));
+for i=from(:)'
+    for j=find(Y(i,:))
+        cand=Y;cand(i,j)=false;
+        cov=double(x)+sum(cand,1)';
+        if all(observation(M,cov)),Y=cand;end
+    end
+end
+end
+
+function s=assignment_text(M,Y)
+chunks={};
+for i=find(any(Y,2))'
+    destinations=M.ids(find(Y(i,:)));
+    chunks{end+1}=sprintf('%d->%s',M.ids(i),mat2str(destinations(:)')); %#ok<AGROW>
+end
+if isempty(chunks),s="";else,s=string(strjoin(chunks,'; '));end
+end
+
+function d=neural_rhs(u,M,c)
+% Differentiable relaxation of PMU placement AND oriented branch channels.
+% Discrete objective = (N_PMU, N_active_channels) lexicographically.
+% Continuous scalar is N_PMU + N_active_channels/(M.arcN+1), which
+% preserves the PMU-first order for binary points without chosen weights.
+n=M.n;K=M.arcN;x=u(1:n);w=u(n+(1:K));
+lam=u(n+K+(1:n));mu=u(n+K+n+(1:n));
+x=max(0,min(1,x));w=max(0,min(1,w));
+cover=x+accumarray(M.arcTo,x(M.arcFrom).*w,[n 1]);
+if strcmp(M.scenario,'ZIB')
+    obs=1-exp(-cover);
+    [obs,tape]=soft_zib(obs,M.clusters);
+    missing=max(0,1-obs);
+    gradObs=lam+c.penaltyObs*missing;
+    gradCover=back_zib(gradObs,tape).*exp(-cover);
+else
+    missing=max(0,M.required-cover);
+    gradCover=lam+c.penaltyObs*missing;
+end
+used=accumarray(M.arcFrom,w,[n 1]);
+excess=max(0,used-M.cap*x);
+capGrad=mu+c.penaltyCh*excess;
+% Gradient of relaxed cardinality and channel terms.
+gx=ones(n,1)-gradCover-M.cap*capGrad;
+gw=ones(K,1)/(K+1);
+for k=1:K
+    i=M.arcFrom(k);j=M.arcTo(k);
+    gx(i)=gx(i)-gradCover(j)*w(k);
+    gw(k)=gw(k)-gradCover(j)*x(i)+capGrad(i);
+end
+dx=max(-5,min(5,-gx));dw=max(-5,min(5,-gw));
+dlam=missing-.05*lam;dmu=excess-.05*mu;
+d=[dx;dw;dlam;dmu];
+end
+
+function E=energy_value(u,M,c)
+% Continuous augmented-Lagrangian diagnostic, NOT a Lyapunov proof.
+n=M.n;K=M.arcN;
+x=max(0,min(1,u(1:n)));w=max(0,min(1,u(n+(1:K))));
+cover=x+accumarray(M.arcTo,x(M.arcFrom).*w,[n 1]);
+if strcmp(M.scenario,'ZIB')
+    obs=1-exp(-cover);[obs,~]=soft_zib(obs,M.clusters);
+    miss=max(0,1-obs);
+else
+    miss=max(0,M.required-cover);
+end
+excess=max(0,accumarray(M.arcFrom,w,[n 1])-M.cap*x);
+lam=u(n+K+(1:n));mu=u(n+K+n+(1:n));
+E=sum(x)+sum(w)/(K+1)+dot(lam,miss)+ ...
+    .5*c.penaltyObs*sum(miss.^2)+dot(mu,excess)+ ...
+    .5*c.penaltyCh*sum(excess.^2);
+end
+
+function [obs,tape]=soft_zib(obs,clusters)
+% Differentiable smooth KCL closure for the neural continuous surrogate.
+% Exact binary KCL inference is checked separately in observation().
+tape=struct('idx',{},'old',{});
+for pass=1:2
+    for k=1:numel(clusters)
+        idx=clusters{k};old=obs(idx);new=old;
+        for j=1:numel(idx)
+            other=[1:j-1 j+1:numel(idx)];
+            new(j)=old(j)+(1-old(j))*prod(old(other));
+        end
+        obs(idx)=new;
+        tape(end+1)=struct('idx',idx,'old',old); %#ok<AGROW>
+    end
+end
+end
+
+function grad=back_zib(grad,tape)
+for t=numel(tape):-1:1
+    ix=tape(t).idx;p=tape(t).old;m=numel(ix);J=zeros(m);
+    for j=1:m
+        other=[1:j-1 j+1:m];gate=prod(p(other));
+        J(j,j)=1-gate;
+        for h=other
+            rest=other(other~=h);
+            J(j,h)=(1-p(j))*prod(p(rest));
+        end
+    end
+    grad(ix)=J'*grad(ix);
+end
+end
+
+function u=project(u,M)
+u(1:M.n+M.arcN)=max(0,min(1,u(1:M.n+M.arcN)));
+u(M.n+M.arcN+1:end)=max(0,min(12,u(M.n+M.arcN+1:end)));
+end
+
+function [times,U]=rk4(F,P,u0,c)
+steps=ceil(c.duration/c.dt);h=c.duration/steps;
+times=(0:steps)'*h;U=zeros(numel(u0),steps+1);U(:,1)=P(u0);
+for j=1:steps
+    y=U(:,j);a=F(times(j),y);
+    b=F(times(j)+h/2,P(y+h*a/2));
+    d=F(times(j)+h/2,P(y+h*b/2));
+    e=F(times(j)+h,P(y+h*d));
+    U(:,j+1)=P(y+h*(a+2*b+2*d+e)/6);
+end
+end
+
+function [times,U]=caputo(alpha,F,P,u0,c)
+% Full-memory Caputo PECE predictor-corrector; no hidden memory reset.
+steps=ceil(c.duration/c.dt);
+assert(steps<=c.maxSteps,'Reduce number of Caputo steps.');
+h=c.duration/steps;times=(0:steps)'*h;
+U=zeros(numel(u0),steps+1);U(:,1)=P(u0);
+V=zeros(size(U));V(:,1)=F(0,U(:,1));
+a=h^alpha/gamma(alpha+1);b=h^alpha/gamma(alpha+2);
+for j=0:steps-1
+    lag=j:-1:0;wp=(lag+1).^alpha-lag.^alpha;
+    predictor=P(u0+a*(V(:,1:j+1)*wp(:)));
+    fp=F(times(j+2),predictor);
+    wc=(lag+2).^(alpha+1)+lag.^(alpha+1)-2*(lag+1).^(alpha+1);
+    wc(1)=j^(alpha+1)-(j-alpha)*(j+1)^alpha;
+    U(:,j+2)=P(u0+b*(V(:,1:j+1)*wc(:)+fp));
+    V(:,j+2)=F(times(j+2),U(:,j+2));
+end
+end
+
+function [bestAlpha,H,C,elapsed]=vsa_alpha(M,c,seed)
+% VORTEX SEARCH ALGORITHM (VSA) for one scalar fractional order alpha.
+% A single incumbent center generates Gaussian candidates; inverse-gamma
+% shrinkage reduces the radius each iteration. A candidate replaces the
+% incumbent only after lexicographic improvement. NO simulated annealing,
+% PSOGSA, exhaustive alpha grid, or look-ahead at evaluation-run seeds.
+% Two fidelity levels: shared-start cheap screening; full postprocessed
+% reranking of a short list, including alpha=1 as an explicit control.
+timer=tic;
+lo=c.alphaLo;hi=c.alphaHi;res=c.vsaResolution;
+assert(lo>0 && hi<=1 && lo<hi && res>0);
+assert(c.vsaPopulation>=2 && c.vsaIterations>=1 && c.vsaShape>0);
+assert(c.vsaPolishTop>=2,'At least two polished alpha candidates required.');
+rng(seed,'twister');
+trainX=.30+.40*rand(M.n,max(c.vsaCheapStarts,c.vsaPolishStarts));
+trainW=.30+.40*rand(M.arcN,max(c.vsaCheapStarts,c.vsaPolishStarts));
+cheapCache=containers.Map('KeyType','char','ValueType','any');
+polishCache=containers.Map('KeyType','char','ValueType','any');
+cheapA=zeros(0,1);cheapP=zeros(0,1);cheapCH=zeros(0,1);
+H=table();C=table();seq=0;
+centre=quantize((lo+hi)/2);
+incAlpha=centre;incCount=Inf;incChannels=Inf;
+% Radius begins at half the search interval and decreases monotonically.
+% gammaincinv is MATLAB's inverse of the regularized lower gamma function.
+referenceGamma=gammaincinv(1-1/(c.vsaIterations+1),c.vsaShape);
+if ~isfinite(referenceGamma) || referenceGamma<=0
+    error('Invalid Vortex Search inverse-gamma radius normalization.');
+end
+[e,~]=evaluate(centre,'INITIAL',0,0,.5*(hi-lo),centre);
+incCount=e.pmus;incChannels=e.channels;incAlpha=centre;
+for it=1:c.vsaIterations
+    a=1-it/(c.vsaIterations+1);
+    radius=.5*(hi-lo)*gammaincinv(a,c.vsaShape)/referenceGamma;
+    % VSA Gaussian proposals; support reflection avoids artificial mass
+    % buildup at the alpha boundaries before quantizing to 0.01.
+    rng(seed+9000+it,'twister');
+    candidates=centre+radius*randn(c.vsaPopulation,1);
+    for j=1:numel(candidates)
+        candidate=quantize(reflect(candidates(j)));
+        [e,~]=evaluate(candidate,'VSA',it,j,radius,centre);
+        if lexbetter(e.pmus,e.channels,candidate,incCount,incChannels,incAlpha)
+            incCount=e.pmus;incChannels=e.channels;incAlpha=candidate;
+        end
+    end
+    centre=incAlpha;
+end
+% Endpoint control is essential: if alpha=1 is best, no fractional-order
+% advantage is asserted. No exhaustive grid or iterative SA chain.
+[e,~]=evaluate(hi,'CONTROL',c.vsaIterations+1,0,0,centre);
+if lexbetter(e.pmus,e.channels,hi,incCount,incChannels,incAlpha)
+    incAlpha=hi;incCount=e.pmus;incChannels=e.channels;
+end
+% Shortlist the best cheap results by PMU count and then assigned channels.
+[~,ord]=sortrows([cheapP cheapCH -cheapA],[1 2 3]);
+shortlist=cheapA(ord(1:min(numel(ord),c.vsaPolishTop)));
+shortlist=unique([shortlist(:);hi],'stable');
+bestAlpha=NaN;bestPMU=Inf;bestCH=Inf;
+for j=1:numel(shortlist)
+    alpha=shortlist(j);
+    [e,~]=evaluate(alpha,'POLISH',c.vsaIterations+2,j,0,centre);
+    C=cat_table(C,table(alpha,e.pmus,e.channels, ...
+        e.nativePct,e.sec,'VariableNames', ...
+        {'Alpha','MeanPMUs','MeanChannels','NativeFeasiblePct','RuntimeSec'}));
+    if lexbetter(e.pmus,e.channels,alpha,bestPMU,bestCH,bestAlpha)
+        bestPMU=e.pmus;bestCH=e.channels;bestAlpha=alpha;
+    end
+end
+assert(isfinite(bestAlpha),'VSA alpha selection returned no valid alpha.');
+C.Selected=abs(C.Alpha-bestAlpha)<1e-9;
+elapsed=toc(timer);
+fprintf('    VSA SELECTED alpha=%.2f | training mean PMUs=%.3f | channels=%.3f | screened=%d polished=%d | %.2fs\n', ...
+    bestAlpha,bestPMU,bestCH,cheapCache.Count,polishCache.Count,elapsed);
+if bestAlpha>=1-1e-9
+    fprintf('    Alpha=1 control selected: no fractional-order advantage established in training.\n');
+end
+
+    function v=reflect(v)
+        span=hi-lo;
+        v=mod(v-lo,2*span);
+        if v>span, v=2*span-v;end
+        v=lo+v;
+    end
+    function a=quantize(a)
+        a=lo+round((max(lo,min(hi,a))-lo)/res)*res;
+        a=max(lo,min(hi,a));a=round(a*1e6)/1e6;
+    end
+    function tf=lexbetter(p,ch,a,bp,bch,ba)
+        tol=1e-9;
+        tf=(p<bp-tol) || (abs(p-bp)<=tol && ch<bch-tol) || ...
+            (abs(p-bp)<=tol && abs(ch-bch)<=tol && (isnan(ba) || a>ba));
+    end
+    function [v,cached]=get_score(alpha,stage)
+        key=sprintf('%.6f',alpha);
+        polished=strcmp(stage,'POLISH');
+        if polished
+            cache=polishCache;nStarts=c.vsaPolishStarts;
+        else
+            cache=cheapCache;nStarts=c.vsaCheapStarts;
+        end
+        cached=isKey(cache,key);
+        if cached,v=cache(key);return;end
+        tt=tic;pmus=zeros(nStarts,1);channels=zeros(nStarts,1);
+        feasibleNative=zeros(nStarts,1);
+        for q=1:nStarts
+            % Fair paired evaluation of each alpha: identical initial
+            % states across alpha; independent from reported run seeds.
+            N=run_neural(M,c,alpha,trainX(:,q),trainW(:,q));
+            recovered=repair_archive(M,N.archive,c,N.bestNative);
+            if polished
+                rng(seed+300000+101*q,'twister');
+                recovered=local_post(M,recovered,c.postSwaps);
+            end
+            d=details(M,recovered);
+            if d.ok,pmus(q)=d.n;channels(q)=d.ch;
+            else,pmus(q)=M.n+1;channels(q)=M.arcN+1;end
+            feasibleNative(q)=100*N.rawFeasible/max(1,N.evals);
+        end
+        v=struct('pmus',mean(pmus),'channels',mean(channels), ...
+            'nativePct',mean(feasibleNative),'sec',toc(tt));
+        if polished
+            polishCache(key)=v;
+        else
+            cheapCache(key)=v;
+            cheapA(end+1,1)=alpha;
+            cheapP(end+1,1)=v.pmus;cheapCH(end+1,1)=v.channels;
+        end
+    end
+    function [v,cached]=evaluate(alpha,stage,it,index,radius,center)
+        alpha=quantize(alpha);
+        [v,cached]=get_score(alpha,stage);
+        if strcmp(stage,'POLISH'),bestObservedAlpha=bestAlpha;
+        else,bestObservedAlpha=incAlpha;end
+        seq=seq+1;
+        H=cat_table(H,table(seq,string(stage),it,index, ...
+            alpha,bestObservedAlpha,center,radius, ...
+            v.pmus,v.channels,incCount,incChannels, ...
+            double(cached),v.sec*double(~cached), ...
+            'VariableNames',{'Evaluation','Stage','Iteration', ...
+            'CandidateIndex','Alpha','BestAlpha','CenterAlpha','Radius', ...
+            'MeanPMUs','MeanChannels','IncumbentPMUs','IncumbentChannels', ...
+            'Cached','EvaluationRuntimeSec'}));
+    end
+end
+
+
+function T=make_simple_summary(D)
+% Only 10 independent RANDOMIZED runs; nominal is excluded.
+if isempty(D),T=table();return;end
+[G,sys,scenario,channels,method]=findgroups(D.System,D.Scenario,D.Channels,D.Method);
+T=table(sys,scenario,channels,method, ...
+    splitapply(@finite_mean,D.FinalPMUs,G), ...
+    splitapply(@finite_sd,D.FinalPMUs,G), ...
+    splitapply(@finite_mean,D.AssignedChannels,G), ...
+    splitapply(@finite_sd,D.AssignedChannels,G), ...
+    splitapply(@(v)100*mean(v),D.Feasible,G), ...
+    splitapply(@finite_mean,D.RuntimeSec,G), ...
+    100*splitapply(@finite_mean,D.PMUGlobalMatch,G), ...
+    100*splitapply(@finite_mean,D.LexGlobalMatch,G), ...
+    'VariableNames',{'System','Scenario','Channels','Method', ...
+    'MeanPMUs','SDPMUs','MeanChannels','SDChannels','SuccessPct','MeanTimeSec', ...
+    'PMUGlobalHitPct','LexGlobalHitPct'});
+end
+
+function T=make_native_summary(D)
+if isempty(D),T=table();return;end
+[G,sys,scenario,channels,method,progress]=findgroups( ...
+    D.System,D.Scenario,D.Channels,D.Method,D.ProgressPct);
+T=table(sys,scenario,channels,method,progress, ...
+    splitapply(@finite_mean,D.RawPMUs,G), ...
+    splitapply(@finite_sd,D.RawPMUs,G), ...
+    'VariableNames',{'System','Scenario','Channels','Method', ...
+    'ProgressPct','MeanRawPMUs','SDRawPMUs'});
+end
+
+function write_simple_outputs(R,c)
+folder=c.out;
+writetable(R.Nominal,fullfile(folder,'01_NOMINAL_PMU_with_MILP_hits.csv'));
+writetable(R.Runs,fullfile(folder,'02_TEN_RANDOM_RUNS_with_MILP_hits.csv'));
+writetable(R.Summary,fullfile(folder,'03_MEAN_SD_10_runs_MILP_hits.csv'));
+writetable(R.Comparison,fullfile(folder,'00_NOMINAL_vs_10RUN_MEAN_SD_MILP.csv'));
+if ~isempty(R.MILP)
+    writetable(R.MILP,fullfile(folder,'10_EXACT_MILP_benchmark_and_certificates.csv'));
+end
+writetable(R.AlphaSelected,fullfile(folder,'04_selected_VSA_alpha.csv'));
+writetable(R.AlphaSearch,fullfile(folder,'05_VSA_alpha_dynamics.csv'));
+writetable(R.AlphaShortlist,fullfile(folder,'06_VSA_full_polish_candidates.csv'));
+if ~isempty(R.Energy)
+    writetable(R.Energy,fullfile(folder,'07_neural_energy_nominal.csv'));
+end
+if ~isempty(R.Convergence)
+    writetable(R.Convergence,fullfile(folder,'08_native_PMU_traces.csv'));
+end
+if ~isempty(R.ConvergenceSummary)
+    writetable(R.ConvergenceSummary,fullfile(folder,'09_native_convergence_mean_SD.csv'));
+end
+if ~c.showFigures,return;end
+names={'FORNN','IORNN','BPSO','BGWO','GA'};
+colors=lines(numel(names));
+nRows=numel(c.networks);nCols=numel(c.scenarios);
+% FIG 1 -- one NOMINAL PMU placement per method and channel capacity.
+f=figure('Color','w','Units','inches','Position',[1 1 14 7]);
+tiledlayout(nRows,nCols,'Padding','compact','TileSpacing','compact');
+for ni=1:nRows
+ for si=1:nCols
+    nexttile;hold on;
+    for mi=1:numel(names)
+        Q=R.Nominal(R.Nominal.System==string(c.networks{ni}) & ...
+            R.Nominal.Scenario==string(c.scenarios{si}) & ...
+            R.Nominal.Method==string(names{mi}),:);
+        Q=sortrows(Q,'Channels');
+        if isempty(Q),continue;end
+        plot(Q.Channels,Q.NominalPMUs,'-o','LineWidth',1.5, ...
+            'Color',colors(mi,:),'DisplayName',names{mi});
+    end
+    % Black dashed reference only where stage-1 MILP optimum is certified.
+    Z=R.MILP(R.MILP.System==string(c.networks{ni}) & ...
+        R.MILP.Scenario==string(c.scenarios{si}) & R.MILP.PMUOptimal,:);
+    if ~isempty(Z)
+        Z=sortrows(Z,'Channels');
+        plot(Z.Channels,Z.MILP_PMUs,'k--s','LineWidth',1.8, ...
+            'DisplayName','MILP certified PMU minimum');
+    end
+    title(sprintf('%s / %s',c.networks{ni},c.scenarios{si}));
+    xlabel('Fixed current channels per PMU');ylabel('Nominal PMU count');
+    xticks(c.channels);grid on;box on;
+    if ni==1 && si==nCols,legend('Location','bestoutside');end
+ end
+end
+save_fig(f,folder,'Fig1_NOMINAL_PMUs_vs_channels');
+% FIG 2 -- 10-run mean and sample SD across channel capacity, all methods.
+f=figure('Color','w','Units','inches','Position',[1 1 14 7]);
+tiledlayout(nRows,nCols,'Padding','compact','TileSpacing','compact');
+for ni=1:nRows
+ for si=1:nCols
+    nexttile;hold on;
+    for mi=1:numel(names)
+        Q=R.Summary(R.Summary.System==string(c.networks{ni}) & ...
+            R.Summary.Scenario==string(c.scenarios{si}) & ...
+            R.Summary.Method==string(names{mi}),:);
+        Q=sortrows(Q,'Channels');
+        if isempty(Q),continue;end
+        e=Q.SDPMUs;e(~isfinite(e))=0; % single-run smoke only
+        errorbar(Q.Channels,Q.MeanPMUs,e,'-o','LineWidth',1.4, ...
+            'CapSize',5,'Color',colors(mi,:),'DisplayName',names{mi});
+    end
+    Z=R.MILP(R.MILP.System==string(c.networks{ni}) & ...
+        R.MILP.Scenario==string(c.scenarios{si}) & R.MILP.PMUOptimal,:);
+    if ~isempty(Z)
+        Z=sortrows(Z,'Channels');
+        plot(Z.Channels,Z.MILP_PMUs,'k--s','LineWidth',1.8, ...
+            'DisplayName','MILP certified PMU minimum');
+    end
+    title(sprintf('%s / %s',c.networks{ni},c.scenarios{si}));
+    xlabel('Fixed current channels per PMU');ylabel('PMUs: mean +/- SD (random runs)');
+    xticks(c.channels);grid on;box on;
+    if ni==1 && si==nCols,legend('Location','bestoutside');end
+ end
+end
+save_fig(f,folder,'Fig2_MEAN_SD_PMUs_vs_channels');
+% FIG 3 -- true Vortex Search alpha, center, Gaussian radius and PMU count.
+f=figure('Color','w','Units','inches','Position',[1 1 13 7]);
+tiledlayout(2,2,'Padding','compact','TileSpacing','compact');
+Q=R.AlphaSearch(R.AlphaSearch.System==string(c.networks{1}) & ...
+    R.AlphaSearch.Scenario==string(c.scenarios{1}),:);
+if ~isempty(Q)
+    nexttile;hold on;
+    plot(Q.Evaluation,Q.Alpha,'.','MarkerSize',10, ...
+        'DisplayName','Evaluated alpha');
+    [~,rowOrder]=sort(Q.Evaluation);
+    plot(Q.Evaluation(rowOrder),Q.CenterAlpha(rowOrder), ...
+        'LineWidth',1.8,'DisplayName','VSA center');
+    P=R.AlphaShortlist(R.AlphaShortlist.System==string(c.networks{1}) & ...
+        R.AlphaShortlist.Scenario==string(c.scenarios{1}),:);
+    if ~isempty(P)
+        sel=P(P.Selected,:);
+        if ~isempty(sel)
+            yline(sel.Alpha(1),'k--','LineWidth',1.6, ...
+                'DisplayName','Final selected alpha');
+        end
+    end
+    title('VSA candidate and center evolution');
+    xlabel('Function evaluation');ylabel('Fractional order alpha');
+    legend('Location','best');grid on;
+    nexttile;hold on;
+    V=Q(Q.Stage=="VSA" & Q.CandidateIndex==1,:);
+    plot(V.Iteration,V.Radius,'-o','LineWidth',1.8);
+    title('Inverse-gamma Gaussian radius shrinkage');
+    xlabel('VSA iteration');ylabel('Search radius');grid on;
+    nexttile;hold on;
+    scatter(Q.Alpha,Q.MeanPMUs,25,'filled', ...
+        'DisplayName','Screened alpha: training PMUs');
+    if ~isempty(P)
+        scatter(P.Alpha,P.MeanPMUs,75,'s','LineWidth',1.4, ...
+            'DisplayName','Full-polish shortlisted alpha');
+    end
+    xlabel('Alpha');ylabel('Training mean PMUs');
+    title('PMU count versus evaluated alpha');grid on;legend('Location','best');
+    nexttile;hold on;
+    if ~isempty(V)
+        % Track best running PMU value after each VSA iteration.
+        vals=arrayfun(@(k)min(Q.MeanPMUs(Q.Iteration<=k & ...
+            (Q.Stage=="VSA" | Q.Stage=="INITIAL"))),V.Iteration);
+        plot(V.Iteration,vals,'-o','LineWidth',1.8);
+    end
+    xlabel('VSA iteration');ylabel('Best screening mean PMUs');
+    title('Vortex Search PMU convergence');grid on;
+end
+save_fig(f,folder,'Fig3_VSA_alpha_search_dynamics');
+
+% FIG 4 -- Neural augmented-Lagrangian energy diagnostics, both networks.
+if ~isempty(R.Energy)
+ f=figure('Color','w','Units','inches','Position',[1 1 12 5]);
+ tiledlayout(1,nRows,'Padding','compact','TileSpacing','compact');
+ for ni=1:nRows
+    nexttile;hold on;
+    for mi=1:2
+        Q=R.Energy(R.Energy.System==string(c.networks{ni}) & ...
+            R.Energy.Method==string(names{mi}),:);
+        if isempty(Q),continue;end
+        plot(Q.Time,Q.AugmentedEnergy,'LineWidth',2, ...
+            'Color',colors(mi,:),'DisplayName',names{mi});
+    end
+    title(sprintf('%s / Simple / 2 channels',c.networks{ni}));
+    xlabel('Neural integration time');ylabel('Augmented energy (diagnostic)');
+    legend('Location','best');grid on;box on;
+ end
+ save_fig(f,folder,'Fig4_NOMINAL_FORNN_IORNN_energy');
+end
+% FIG 5 -- PMU optimum hit rates; draw data ONLY for proved MILP cases.
+if any(R.MILP.PMUOptimal)
+    f=figure('Color','w','Units','inches','Position',[1 1 14 7]);
+    tiledlayout(nRows,nCols,'Padding','compact','TileSpacing','compact');
+    for ni=1:nRows
+        for si=1:nCols
+            nexttile;hold on;
+            for mi=1:numel(names)
+                Q=R.Summary(R.Summary.System==string(c.networks{ni}) & ...
+                    R.Summary.Scenario==string(c.scenarios{si}) & ...
+                    R.Summary.Method==string(names{mi}),:);
+                Q=sortrows(Q,'Channels');
+                Q=Q(isfinite(Q.PMUGlobalHitPct),:);
+                if isempty(Q),continue;end
+                plot(Q.Channels,Q.PMUGlobalHitPct,'-o','LineWidth',1.6, ...
+                    'Color',colors(mi,:),'DisplayName',names{mi});
+            end
+            title(sprintf('%s / %s',c.networks{ni},c.scenarios{si}));
+            xlabel('Fixed current channels per PMU');
+            ylabel('MILP-proven PMU optimum hit rate (%)');
+            ylim([-2 102]);xticks(c.channels);grid on;box on;
+            if ni==1 && si==nCols,legend('Location','bestoutside');end
+        end
+    end
+    save_fig(f,folder,'Fig5_Proven_MILP_PMU_Optimality_Hit_Rates');
+end
+end
+
+function save_fig(f,dir,name)
+try
+    exportgraphics(f,fullfile(dir,[name '.png']),'Resolution',300);
+    exportgraphics(f,fullfile(dir,[name '.pdf']),'ContentType','vector');
+catch err
+    warning('Figure export fallback: %s',err.message);
+    print(f,fullfile(dir,name),'-dpng','-r300');
+    print(f,fullfile(dir,name),'-dpdf');
+end
+end
+
+function T=cat_table(T,U)
+if isempty(T),T=U;else,T=[T;U];end
+end
+function a=finite_mean(x)
+x=x(isfinite(x));if isempty(x),a=NaN;else,a=mean(x);end
+end
+function a=finite_sd(x)
+x=x(isfinite(x));if numel(x)<2,a=NaN;else,a=std(x);end
+end
+function s=numtext(v)
+if isfinite(v),s=sprintf('%d',round(v));else,s='FAIL';end
+end
+
+function [row,sol]=run_exact_lex_milp(M,c)
+% EXACT INTEGER BENCHMARK, INDEPENDENT OF THE FIVE HEURISTICS.
+% Stage 1: globally minimize PMU count. Stage 2: fix that count and
+% globally minimize current-channel assignments. The status OPTIMAL
+% requires BOTH intlinprog stages to be certified (exitflag == 1).
+% If a time limit is reached, we may retain a feasible INCUMBENT but
+% NEVER call it globally optimal. Missing Optimization Toolbox gives NaNs.
+row=table(string(M.name),string(M.scenario),M.cap,NaN,NaN, ...
+    false,false,string('NOT_SOLVED'),NaN,NaN,0, ...
+    string(''),string(''), ...
+    'VariableNames',{'System','Scenario','Channels','MILP_PMUs', ...
+    'MILP_Channels','PMUOptimal','LexOptimal','MILPStatus', ...
+    'Stage1ExitFlag','Stage2ExitFlag','MILPRuntimeSec', ...
+    'MILP_PMUBuses','MILP_ChannelAssignments'});
+sol=struct('x',[],'w',[],'Y',[]);
+if exist('intlinprog','file')~=2 && exist('intlinprog','file')~=6
+    row.MILPStatus="UNAVAILABLE_INTLINPROG";
+    warning('intlinprog missing: global-optimality matches cannot be claimed.');
+    return;
+end
+clock=tic;
+try
+    [A,b,lb,ub,total,n,K]=build_exact_pmu_milp(M);
+    f1=zeros(total,1);f1(1:n)=1;
+    f2=zeros(total,1);f2(n+(1:K))=1;
+    options=optimoptions('intlinprog','Display',c.milpDisplay, ...
+        'MaxTime',c.milpTimeLimitSec, ...
+        'RelativeGapTolerance',0,'AbsoluteGapTolerance',0);
+    [v1,~,ef1]=intlinprog(f1,(1:total)',A,b,[],[],lb,ub,options);
+    row.Stage1ExitFlag=ef1;
+    if isempty(v1)
+        row.MILPStatus="NO_FEASIBLE_INCUMBENT";
+        row.MILPRuntimeSec=toc(clock);return;
+    end
+    s1=milp_to_solution(v1,M,n,K);
+    if ~milp_solution_valid(M,s1)
+        row.MILPStatus="INVALID_STAGE1_INCUMBENT";
+        row.MILPRuntimeSec=toc(clock);
+        warning('MILP stage 1 failed independent observability validation.');
+        return;
+    end
+    s=s1;pmuCount=nnz(s1.x);
+    row.PMUOptimal=(ef1==1);
+    % Second objective conditional on the feasible stage-1 PMU cardinality.
+    % If stage 1 did not prove its optimum, even a solved second stage
+    % CANNOT establish global lexicographic optimality.
+    Aeq=sparse(ones(1,n),1:n,ones(1,n),1,total);
+    [v2,~,ef2]=intlinprog(f2,(1:total)',A,b,Aeq,pmuCount,lb,ub,options);
+    row.Stage2ExitFlag=ef2;
+    stage2Valid=false;
+    if ~isempty(v2)
+        s2=milp_to_solution(v2,M,n,K);
+        if milp_solution_valid(M,s2) && nnz(s2.x)==pmuCount && ...
+                nnz(s2.Y)<=nnz(s1.Y)
+            s=s2;
+            stage2Valid=true;
+        else
+            row.MILPStatus="INVALID_STAGE2_INCUMBENT";
+            % Keep the original verified feasible solution; no stage-2 proof.
+            ef2=NaN;
+        end
+    end
+    row.LexOptimal=row.PMUOptimal && (ef2==1) && stage2Valid && ...
+        milp_solution_valid(M,s) && nnz(s.x)==pmuCount;
+    row.MILP_PMUs=nnz(s.x);
+    row.MILP_Channels=nnz(s.Y);
+    row.MILP_PMUBuses=string(strtrim(sprintf('%d ',M.ids(s.x))));
+    row.MILP_ChannelAssignments=assignment_text(M,s.Y);
+    if row.LexOptimal
+        row.MILPStatus="OPTIMAL_BOTH_OBJECTIVES";
+    elseif row.PMUOptimal
+        row.MILPStatus="PMU_OPTIMAL_CHANNEL_UNPROVEN";
+    else
+        row.MILPStatus="FEASIBLE_NOT_PROVEN_OPTIMAL";
+    end
+    sol=s;
+catch err
+    row.MILPStatus="ERROR_"+string(err.identifier);
+    warning('MILP benchmark error: %s',err.message);
+end
+row.MILPRuntimeSec=toc(clock);
+end
+
+function [A,b,lb,ub,total,n,K]=build_exact_pmu_milp(M)
+% Exact MILP for the same model checked by observation(M,cov):
+% - Simple: at least one PMU voltage or measured incoming branch;
+% - N-1: at least two distinct PMU sources for every bus;
+% - ZIB: direct observation plus finite-round Boolean KCL closure.
+%
+% The ZIB model is fully layered. Its inference may only use the PREVIOUS
+% layer, preventing circular/self-supporting KCL observability, which is a
+% known pitfall of unlayered binary auxiliary constraints.
+n=M.n;K=M.arcN;
+x=(1:n)';y=(n+(1:K))';
+useZIB=strcmp(M.scenario,'ZIB');
+if useZIB
+    T=n; % each useful synchronous inference observes >= 1 new bus.
+    % q pairs (KCL cluster index, inferred target, other cluster members)
+    tgt=zeros(0,1); other=cell(0,1);
+    for k=1:numel(M.clusters)
+        cluster=M.clusters{k}(:);
+        if numel(cluster)<2,continue;end
+        for j=1:numel(cluster)
+            tgt(end+1,1)=cluster(j); %#ok<AGROW>
+            other{end+1,1}=cluster(cluster~=cluster(j)); %#ok<AGROW>
+        end
+    end
+    qCount=numel(tgt);
+    sIdx=n+K+reshape((1:n*(T+1))',n,T+1);
+    qIdx=n+K+n*(T+1)+reshape((1:qCount*T)',qCount,T);
+    total=n+K+n*(T+1)+qCount*T;
+else
+    T=0;qCount=0;tgt=[];other={};sIdx=[];qIdx=[];
+    total=n+K;
+end
+lb=zeros(total,1);ub=ones(total,1);
+if useZIB,lb(sIdx(:,end))=1;end
+% Sparse row assembler: each inequality sum_j a_ij v_j <= b_i.
+riBlocks=cell(0,1);ciBlocks=cell(0,1);vaBlocks=cell(0,1);
+b=zeros(0,1);nr=0;
+for arc=1:K
+    % A channel can exist only if its originating PMU exists: y_ij<=x_i
+    add_ub([y(arc);x(M.arcFrom(arc))],[1;-1],0);
+end
+for bus=1:n
+    arcs=M.out{bus};
+    if ~isempty(arcs)
+        add_ub([y(arcs(:));x(bus)],[ones(numel(arcs),1);-M.cap],0);
+    end
+end
+if ~useZIB
+    for bus=1:n
+        inc=M.in{bus};
+        add_ub([x(bus);y(inc(:))],-ones(numel(inc)+1,1),-M.required);
+    end
+else
+    % s(bus,0) is EXACTLY the OR of own PMU and all incoming channels.
+    for bus=1:n
+        inc=M.in{bus};s=sIdx(bus,1);
+        add_ub([x(bus);s],[1;-1],0);
+        for arc=inc(:)'
+            add_ub([y(arc);s],[1;-1],0);
+        end
+        add_ub([s;x(bus);y(inc(:))],[1;-ones(numel(inc)+1,1)],0);
+    end
+    qForTarget=cell(n,1);
+    for j=1:qCount
+        qForTarget{tgt(j)}(end+1,1)=j;
+    end
+    for t=1:T
+        prev=sIdx(:,t); nxt=sIdx(:,t+1);
+        % q_{cluster,target,t} == AND(all other observed prev-layer buses)
+        for z=1:qCount
+            q=qIdx(z,t);oth=other{z};
+            for bb=oth(:)'
+                add_ub([q;prev(bb)],[1;-1],0);
+            end
+            add_ub([prev(oth);q],[ones(numel(oth),1);-1],numel(oth)-1);
+            add_ub([q;nxt(tgt(z))],[1;-1],0);
+        end
+        for bus=1:n
+            relevant=qForTarget{bus};
+            % s(bus,t) <=> s(bus,t-1) OR any inferred q_{bus,t}.
+            add_ub([prev(bus);nxt(bus)],[1;-1],0);
+            add_ub([nxt(bus);prev(bus);qIdx(relevant,t)], ...
+                [1;-ones(numel(relevant)+1,1)],0);
+        end
+    end
+end
+if nr>0
+    ri=vertcat(riBlocks{:});ci=vertcat(ciBlocks{:});va=vertcat(vaBlocks{:});
+else
+    ri=zeros(0,1);ci=zeros(0,1);va=zeros(0,1);
+end
+A=sparse(ri,ci,va,nr,total);
+assert(numel(b)==nr && size(A,2)==total,'Malformed MILP sparse model');
+
+    function add_ub(indices,values,rhs)
+        indices=indices(:);values=values(:);
+        assert(numel(indices)==numel(values));
+        mask=values~=0;
+        nr=nr+1;
+        rows=repmat(nr,nnz(mask),1);
+        riBlocks{nr,1}=rows;
+        ciBlocks{nr,1}=indices(mask);
+        vaBlocks{nr,1}=values(mask);
+        b(nr,1)=rhs;
+    end
+end
+
+function s=milp_to_solution(v,M,n,K)
+x=logical(round(v(1:n))>=1);
+w=double(round(v(n+(1:K)))>=1);
+Y=false(n,n);
+for arc=1:K
+    if w(arc)>0
+        Y(M.arcFrom(arc),M.arcTo(arc))=true;
+    end
+end
+s=struct('x',x,'w',w,'Y',Y);
+end
+
+function valid=milp_solution_valid(M,s)
+valid=false;
+if isempty(s.x),return;end
+if any(sum(s.Y,2)>M.cap) || any(any(s.Y(~s.x,:))) || ...
+        any(any(s.Y & ~logical(M.Adj)))
+    return;
+end
+cov=double(s.x)+sum(s.Y,1)';
+valid=all(observation(M,cov));
+end
+
+function D=attach_milp(D,Reference,countCol,channelCol)
+% Join the independently computed certificate onto nominal or random rows.
+% NaN = unknown when MILP did not prove optimality (NOT a failed hit).
+if isempty(D),return;end
+D=outerjoin(D,Reference,'Keys',{'System','Scenario','Channels'}, ...
+    'MergeKeys',true,'Type','left');
+if strcmp(countCol,'NominalPMUs')
+    pmuName='NominalPMUGlobalMatch';lexName='NominalLexGlobalMatch';
+else
+    pmuName='PMUGlobalMatch';lexName='LexGlobalMatch';
+end
+D.(pmuName)=NaN(height(D),1);D.(lexName)=NaN(height(D),1);
+for j=1:height(D)
+    if D.PMUOptimal(j)
+        D.(pmuName)(j)=double(D.Feasible(j) && ...
+            D.(countCol)(j)==D.MILP_PMUs(j));
+    end
+    if D.LexOptimal(j)
+        D.(lexName)(j)=double(D.Feasible(j) && ...
+            D.(countCol)(j)==D.MILP_PMUs(j) && ...
+            D.(channelCol)(j)==D.MILP_Channels(j));
+    end
+end
+end
+
+
+function selftest()
+% Five-leaf star: a central 2-channel PMU cannot cover five leaves.
+M=struct('name','star','n',6,'ids',(1:6)','Adj',sparse(6,6), ...
+    'clusters',{{}},'scenario','Simple','required',1,'cap',2, ...
+    'arcFrom',[],'arcTo',[],'arcN',0,'in',{{}},'out',{{}});
+for i=2:6,M.Adj(1,i)=1;M.Adj(i,1)=1;end
+[M.arcFrom,M.arcTo]=find(M.Adj);M.arcN=numel(M.arcFrom);
+M.in=cell(M.n,1);M.out=cell(M.n,1);
+for k=1:M.arcN
+    M.out{M.arcFrom(k)}(end+1)=k;
+    M.in{M.arcTo(k)}(end+1)=k;
+end
+x=logical([1;0;0;0;0;0]);
+M.cap=2;
+assert(~decode(M,x,ones(M.arcN,1)), ...
+    'Two-channel central star incorrectly observable.');
+M.cap=5;
+assert(decode(M,x,ones(M.arcN,1)), ...
+    'Five-channel central star should observe five neighbours.');
+for cap=2:5
+    M.cap=cap;
+    for mask=0:2^M.n-1
+        z=logical(bitget(uint16(mask),1:M.n)');
+        [~,~,~,Y]=decode(M,z,ones(M.arcN,1));
+        assert(all(sum(Y,2)<=cap));
+        assert(~any(any(Y(~z,:))));
+        assert(~any(any(Y & ~logical(M.Adj))));
+    end
+end
+M.cap=4;
+assert(decode(M,true(M.n,1),ones(M.arcN,1)));
+assert(better(3,10,4,1));
+assert(better(3,6,3,7));
+c=config('smoke');c.showFigures=false;
+x0=.3+.4*rand(M.n,1);w0=.3+.4*rand(M.arcN,1);
+for alpha=[.8 1]
+    N=run_neural(M,c,alpha,x0,w0);
+    S=repair_archive(M,N.archive,c);
+    d=details(M,S);assert(~isempty(S) && d.ok,'Neural repair failure.');
+end
+X=rand(M.n+M.arcN,c.population)<.5;
+for algo={'BPSO','BGWO','GA'}
+    rng(1234,'twister');
+    N=run_population(M,c,algo{1},X);
+    assert(N.evals==c.population*(c.generations+1),'Native evaluation mismatch.');
+    assert(all(isfinite(N.rawTrace)),'Bad native trace.');
+    S=repair_archive(M,N.archive,c,N.bestNative);
+    d=details(M,S);assert(~isempty(S) && d.ok,'Metaheuristic repair failure.');
+end
+% VSA search: Gaussian proposals, decreasing inverse-gamma radius,
+% common training starts and independent shortlisted polished reranking.
+c.vsaIterations=3;c.vsaPopulation=4;c.vsaCheapStarts=1;
+c.vsaPolishStarts=1;c.vsaPolishTop=3;
+[aa,H,C,~]=vsa_alpha(M,c,123);
+assert(aa>=c.alphaLo && aa<=c.alphaHi && ...
+    any(H.Stage=="VSA") && any(H.Stage=="POLISH") && ...
+    all(C.Alpha>=c.alphaLo & C.Alpha<=c.alphaHi));
+T=H(H.Stage=="VSA",:);
+assert(all(diff(T.Radius(T.CandidateIndex==1))<=1e-12), ...
+    'VSA search radius did not shrink.');
+if exist('intlinprog','file')==2 || exist('intlinprog','file')==6
+    % Independent exact PMU-count check against exhaustive PMU masks for
+    % the tiny star test (not part of the actual study).
+    for cap=[2 5]
+        M.cap=cap; M.scenario='Simple';M.required=1;
+        [row,~]=run_exact_lex_milp(M,c);
+        if row.PMUOptimal
+            counts=[];
+            for mask=0:2^M.n-1
+                bits=logical(bitget(uint16(mask),1:M.n)');
+                if decode(M,bits,ones(M.arcN,1))
+                    counts(end+1)=nnz(bits); %#ok<AGROW>
+                end
+            end
+            assert(row.MILP_PMUs==min(counts),'MILP count disagrees with brute PMU masks.');
+        end
+    end
+else
+    fprintf('MILP selftest skipped: Optimization Toolbox intlinprog is unavailable.\n');
+end
+% Regression: a per-capacity summary must first receive MILP match flags.
+% One verified exact match and one nonmatching run should give 50% hits.
+D=table(repmat(string('star'),2,1),repmat(string('Simple'),2,1), ...
+    [2;2],repmat(string('FORNN'),2,1),[3;4],[2;3], ...
+    [true;true],[0.5;0.7], ...
+    'VariableNames',{'System','Scenario','Channels','Method', ...
+    'FinalPMUs','AssignedChannels','Feasible','RuntimeSec'});
+Ref=table(string('star'),string('Simple'),2,3,2,true,true, ...
+    'VariableNames',{'System','Scenario','Channels', ...
+    'MILP_PMUs','MILP_Channels','PMUOptimal','LexOptimal'});
+Checked=attach_milp(D,Ref,'FinalPMUs','AssignedChannels');
+Summary=make_simple_summary(Checked);
+assert(isequal(Summary.PMUGlobalHitPct,50) && ...
+    isequal(Summary.LexGlobalHitPct,50), ...
+    'MILP-matched per-capacity summary regression failed.');
+% Without a mathematical certificate the corresponding hit rates are unknown.
+Ref.PMUOptimal=false;Ref.LexOptimal=false;
+Checked=attach_milp(D,Ref,'FinalPMUs','AssignedChannels');
+Summary=make_simple_summary(Checked);
+assert(isnan(Summary.PMUGlobalHitPct) && isnan(Summary.LexGlobalHitPct), ...
+    'Uncertified MILP runs must not report a global-optimum hit rate.');
+fprintf('Selftest passed: fixed caps, five heuristics, reference BPSO/BGWO, VSA, MILP match reporting and channel limits.\n');
+end
